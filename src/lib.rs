@@ -3,10 +3,10 @@
 use core::fmt::{Formatter};
 use core::marker;
 use core::fmt;
-use embedded_hal::blocking::spi::{Write, Transfer};
-use embedded_hal::digital::v2::OutputPin;
+use embedded_hal::spi::blocking::{Write, Transfer};
+use embedded_hal::digital::blocking::OutputPin;
 use cortex_m::asm::delay;
-use vhrdcan::{id::{FrameId, StandardId, ExtendedId}, frame::{Frame, FrameRef}};
+use embedded_hal::can::{ExtendedId, Frame, Id, StandardId};
 
 /// Shows that register has `read` method.
 pub trait Readable {}
@@ -424,18 +424,21 @@ impl<E, SPI, CS> Mcp25625Ral<SPI, CS>
         self.cs.set_low().ok();
         let _ = self.spi.write(&[Self::READ_CMD, addr]);
         let mut buf = [0u8; 1];
-        let r = self.spi.transfer(&mut buf);
+        let r = self.spi.transfer(&mut buf, &[]);
         delay(self.one_cp);
         self.cs.set_high().ok();
         delay(self.one_cp * 3);
-        r.unwrap_or(&[0u8])[0]
+        match r {
+            Ok(_) => buf[0],
+            Err(_) => 0
+        }
     }
 
     // Reads from 0x61/0x66 or 0x71/0x76 for buffers 0/1
     pub fn read_rxbuf(&mut self, addr: McpFastRxRead, buf: &mut [u8]) {
         self.cs.set_low().ok();
         let _ = self.spi.write(&[Self::READ_RX_BUF_CMD | ((addr as u8) << 1)]);
-        let _ = self.spi.transfer(buf);
+        let _ = self.spi.transfer(buf, &[]);
         delay(self.one_cp);
         self.cs.set_high().ok();
         delay(self.one_cp * 3);
@@ -528,6 +531,13 @@ pub enum McpErrorKind {
     NoTxSlotsAvailable,
     TooBig,
     SpiIsBroken
+}
+
+impl embedded_hal::can::Error for McpErrorKind {
+    fn kind(&self) -> embedded_hal::can::ErrorKind {
+        // TODO better mapping
+        embedded_hal::can::ErrorKind ::Other
+    }
 }
 
 /// Convert enum to bits
@@ -695,7 +705,7 @@ pub enum McpReceiveBuffer {
 pub struct McpCanMessage {
     pub len: u8,
     pub data: [u8; 8],
-    pub address: FrameId,
+    pub address: Id,
     pub filter: McpAcceptanceFilter
 }
 
@@ -726,17 +736,17 @@ impl fmt::Debug for McpCanMessage {
 #[derive(Eq, PartialEq)]
 pub struct FiltersConfigBuffer0 {
     pub mask: FiltersMask,
-    pub filter0: FrameId,
-    pub filter1: Option<FrameId>
+    pub filter0: Id,
+    pub filter1: Option<Id>
 }
 
 #[derive(Eq, PartialEq)]
 pub struct FiltersConfigBuffer1 {
     pub mask: FiltersMask,
-    pub filter2: FrameId,
-    pub filter3: Option<FrameId>,
-    pub filter4: Option<FrameId>,
-    pub filter5: Option<FrameId>,
+    pub filter2: Id,
+    pub filter3: Option<Id>,
+    pub filter4: Option<Id>,
+    pub filter5: Option<Id>,
 }
 
 #[derive(Eq, PartialEq)]
@@ -761,10 +771,10 @@ impl FiltersMask {
     fn mask_bits(&self) -> u32 {
         use FiltersMask::*;
         match self {
-            AllExtendedIdBits => vhrdcan::EXTENDED_ID_ALL_BITS,
-            OnlyStandardIdBits => (vhrdcan::STANDARD_ID_ALL_BITS as u32) << 18,
+            AllExtendedIdBits => ExtendedId::MAX.as_raw(),
+            OnlyStandardIdBits => (StandardId::MAX.as_raw() as u32) << 18,
             StandardIdBitsAndDataBytes01(byte0, byte1) => {
-                (vhrdcan::STANDARD_ID_ALL_BITS as u32) << 18 | (*byte0 as u32) << 8 | (*byte1 as u32)
+                (StandardId::MAX.as_raw() as u32) << 18 | (*byte0 as u32) << 8 | (*byte1 as u32)
             },
             Custom(mask) => *mask
         }
@@ -1027,22 +1037,22 @@ impl<E, SPI, CS> MCP25625<SPI, CS>
         }
     }
 
-    pub fn send(&mut self, frame: FrameRef, buffer_choice: TxBufferChoice, _: McpPriority) -> Result<(), McpErrorKind> {
-        if frame.data.len() > 8 {
+    pub fn send(&mut self, frame: &CANFrame, buffer_choice: TxBufferChoice, _: McpPriority) -> Result<(), McpErrorKind> {
+        if frame.data().len() > 8 {
             return Err(McpErrorKind::TooBig);
         }
         let buf = self.find_empty_txbuf(buffer_choice)?;
-        let (sidh, sidl, eid8, eid0) = calculate_id_regs(frame.id);
-        let dlc = frame.data.len() as u8 & 0b1111;
+        let (sidh, sidl, eid8, eid0) = calculate_id_regs(frame.id());
+        let dlc = frame.data().len() as u8 & 0b1111;
         //let ctrl = (1 << 3) | ((priority as u8) & 0b11);
         let buf_config = [sidh, sidl, eid8, eid0, dlc];
-        self.ral.write_many2(buf.txb_sidh, &buf_config, frame.data);
+        self.ral.write_many2(buf.txb_sidh, &buf_config, frame.data());
         self.ral.write_raw(&[buf.rts_cmd]);
         Ok(())
     }
 
     /// Read RX buffer and clear INTF flags automatically on cs pin raise
-    pub fn receive(&mut self, buffer: McpReceiveBuffer) -> Frame<8> {
+    pub fn receive(&mut self, buffer: McpReceiveBuffer) -> CANFrame {
         let block_start_addr = match buffer {
             McpReceiveBuffer::Buffer0 => McpFastRxRead::RXB0SIDH, // sidh addr
             McpReceiveBuffer::Buffer1 => McpFastRxRead::RXB1SIDH
@@ -1058,9 +1068,9 @@ impl<E, SPI, CS> MCP25625<SPI, CS>
         let is_extended = sidl & (1 << 3) != 0;
         let frame_id = if is_extended {
             let address = ((sidh as u32) << 21) | ((sidl as u32 & 0xE0) << 13) | (((sidl & 0b11) as u32) << 16) | ((eid8 as u32) << 8) | eid0 as u32;
-            FrameId::Extended(unsafe { ExtendedId::new_unchecked(address) })
+            Id::Extended(unsafe { ExtendedId::new_unchecked(address) })
         } else {
-            FrameId::Standard(unsafe { StandardId::new_unchecked(((sidh as u16) << 3) | ((sidl >> 5) as u16)) })
+            Id::Standard(unsafe { StandardId::new_unchecked(((sidh as u16) << 3) | ((sidl >> 5) as u16)) })
         };
 
         let mut data = [0u8; 8];
@@ -1069,9 +1079,8 @@ impl<E, SPI, CS> MCP25625<SPI, CS>
         if data_len > 8 {
             data_len = 8;
         }
-        unsafe {
-            Frame::new_move_unchecked(frame_id, data, data_len as u16)
-        }
+
+        CANFrame::new(frame_id, &data[..data_len as usize]).unwrap()
     }
 
     fn configure_filters(&mut self, filters0: FiltersConfigBuffer0, filters1: Option<FiltersConfigBuffer1>) {
@@ -1118,7 +1127,7 @@ impl<E, SPI, CS> MCP25625<SPI, CS>
         }
     }
 
-    fn filter(&mut self, filter: Filter, id: FrameId) {
+    fn filter(&mut self, filter: Filter, id: Id) {
         let (sidh, sidl, eid8, eid0) = calculate_id_regs(id);
         use Filter::*;
         let base_address = match filter {
@@ -1160,6 +1169,26 @@ impl<E, SPI, CS> MCP25625<SPI, CS>
     }
 }
 
+impl<E, SPI, CS> embedded_hal::can::blocking::Can for MCP25625<SPI, CS>
+where
+    E: core::fmt::Debug,
+    SPI: Transfer<u8, Error = E> + Write<u8, Error = E>,
+    CS: OutputPin
+{
+    type Frame = CANFrame;
+
+    type Error = McpErrorKind;
+
+    fn transmit(&mut self, frame: &Self::Frame) -> Result<(), Self::Error> {
+        self.send(frame.clone(), TxBufferChoice::Any, McpPriority::LowIntermediate)
+    }
+
+    fn receive(&mut self) -> Result<Self::Frame, Self::Error> {
+        let frame = self.receive(McpReceiveBuffer::Buffer0);
+        Ok(frame)
+    }
+}
+
 // SIDH, SIDL (withoud EXIDE set), EID8, EID0
 fn calculate_mask_regs(mask: u32) -> (u8, u8, u8, u8) {
     (
@@ -1169,15 +1198,55 @@ fn calculate_mask_regs(mask: u32) -> (u8, u8, u8, u8) {
         (mask & 0xFF) as u8
     )
 }
-// SIDH, SIDL (EXIDE depends on FrameId), EID8, EID0
-fn calculate_id_regs(id: FrameId) -> (u8, u8, u8, u8) {
+// SIDH, SIDL (EXIDE depends on Id), EID8, EID0
+fn calculate_id_regs(id: Id) -> (u8, u8, u8, u8) {
     match id {
-        FrameId::Standard(sid) => {
-            ((sid.inner() >> 3) as u8, ((sid.inner() as u8 & 0b111) << 5), 0u8, 0u8)
+        Id::Standard(sid) => {
+            ((sid.as_raw() >> 3) as u8, ((sid.as_raw() as u8 & 0b111) << 5), 0u8, 0u8)
         },
-        FrameId::Extended(eid) => {
-            let mask_regs = calculate_mask_regs(eid.inner());
+        Id::Extended(eid) => {
+            let mask_regs = calculate_mask_regs(eid.as_raw());
             (mask_regs.0, mask_regs.1 | (1 << 3), mask_regs.2, mask_regs.3)
         }
+    }
+}
+
+pub struct CANFrame {
+    id: Id,
+    data: [u8; 8],
+    rtr: bool,
+    dlc: usize,
+}
+
+impl embedded_hal::can::Frame for CANFrame {
+    fn new(id: impl Into<Id>, data: &[u8]) -> Option<Self> {
+        let mut data_bytes = [0; 8];
+        data_bytes[..data.len()].copy_from_slice(data);
+
+        Some(CANFrame { id: id.into(), data: data_bytes, rtr: false, dlc: data.len() })
+    }
+
+    fn new_remote(id: impl Into<Id>, dlc: usize) -> Option<Self> {
+        Some(CANFrame { id: id.into(), data: [0;8], rtr: true, dlc })
+    }
+
+    fn is_extended(&self) -> bool {
+        matches!(self.id, embedded_hal::can::Id::Extended(_))
+    }
+
+    fn is_remote_frame(&self) -> bool {
+        self.rtr
+    }
+
+    fn id(&self) -> Id {
+        self.id
+    }
+
+    fn dlc(&self) -> usize {
+        self.dlc
+    }
+
+    fn data(&self) -> &[u8] {
+        &self.data
     }
 }

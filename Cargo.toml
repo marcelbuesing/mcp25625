@@ -9,5 +9,5 @@ description = "MCP25625 and MCP2515 SPI-CANBus no_std driver"
 
 [dependencies]
 cortex-m = "0.6"
-embedded-hal = "0.2"
-vhrdcan = { git = "https://github.com/vhrdtech/vhrdcan.git" }
+embedded-hal = "1.0.0-alpha.6"
+# vhrdcan = { git = "https://github.com/vhrdtech/vhrdcan.git" }
